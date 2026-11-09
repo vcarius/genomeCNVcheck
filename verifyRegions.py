@@ -17,7 +17,7 @@ Depth ratio used for classification
   default         core depth / flank depth (legacy behaviour). The flank can contain neighbouring
                   events and N gaps (zero depth), which inflates the ratio next to gaps.
   --cnv-windows   core depth / expected depth of the copy-number segment containing the ROI
-                  (median depth of that segment in window_cnv_calls.tsv from analyze_cnv.py).
+                  (median depth of that segment in window_cnv_calls.tsv from analyze_cnv_v3.py).
                   Independent of the flank. Core depth for this ratio is computed exactly like
                   run_cnv.sh computes window depth (mosdepth -x -F 1796: read span, all MAPQ,
                   primary + supplementary). If run_cnv.sh was run with -S (supplementary excluded),
@@ -71,10 +71,16 @@ def parse_args():
     p.add_argument("--het-indel-ratio", type=float, default=0.25,
                    help="Indel-read fraction for haplotype divergence / heterozygous SV (default 0.25)")
     p.add_argument("--cnv-windows", default=None,
-                   help="window_cnv_calls.tsv (analyze_cnv.py): classify with core / segment depth")
+                   help="window_cnv_calls.tsv (analyze_cnv_v3.py): classify with core / segment depth")
     p.add_argument("--span-exclude-supplementary", action="store_true",
                    help="Exclude supplementary alignments from the core depth used against the CN segment "
                         "(only if run_cnv.sh was run with -S)")
+    p.add_argument("--baseline-depth", type=float, default=None,
+                   help="Disomic depth for Depth_Ratio_Core_vs_Baseline (default: median depth_eff of the disomic "
+                        "windows of --cnv-windows)")
+    p.add_argument("--ambiguous-ratio", type=float, default=3.0,
+                   help="Coord_Ambiguous = core depth / disomic baseline >= this (default 3.0 = 6 copies or more). Flags "
+                        "collapses that a CN segment of their own hides from the segment ratio; status is unchanged")
     p.add_argument("-o", "--output", default="structural_audit.tsv", help="Output TSV")
     return p.parse_args()
 
@@ -116,11 +122,13 @@ class SegmentDepth:
         w = pd.read_csv(path, sep="\t", dtype={"chrom": str}, na_values=["NA"])
         need = {"chrom", "start", "end", "depth_eff", "seg_id"}
         if not need.issubset(w.columns):
-            sys.exit(f"[ERROR] {path} lacks {sorted(need - set(w.columns))}: use analyze_cnv.py output.")
+            sys.exit(f"[ERROR] {path} lacks {sorted(need - set(w.columns))}: use analyze_cnv_v3.py output.")
         ok = np.isfinite(w["depth_eff"])
         if "low_mappability" in w.columns:
             ok &= ~w["low_mappability"].astype(str).str.lower().eq("true")
         self.seg_depth = w[ok & (w["seg_id"] >= 0)].groupby("seg_id")["depth_eff"].median().to_dict()
+        self.baseline = float(w.loc[ok & (w.get("seg_state") == "disomic"), "depth_eff"].median()) \
+            if "seg_state" in w.columns else np.nan
         self.by_chr = {c: (g["start"].to_numpy(), g["end"].to_numpy(), g["seg_id"].to_numpy())
                        for c, g in w.sort_values(["chrom", "start"]).groupby("chrom")}
 
@@ -278,12 +286,16 @@ def audit_roi(sam, chrom, raw_start, raw_end, a, seg):
         ratio_used, used = ratio_flank, "flank"
 
     status = classify(n_clean, n_indel_span, n_touch, perc_core_bp, ratio_used, len(core_indel), flank_bp, a)
+    base = a.baseline_depth if a.baseline_depth else (seg.baseline if seg else np.nan)
+    ratio_base = core_depth_all / base if np.isfinite(base) and base > 0 else np.nan
     return [chrom, start, end, roi_len, n_touch, n_clean, n_indel_span,
             f"{core_depth:.2f}", f"{flank_depth:.2f}", f"{ratio_flank:.2f}",
             f"{core_depth_all:.2f}", "NA" if not np.isfinite(exp_depth) else f"{exp_depth:.2f}",
             "NA" if not np.isfinite(ratio_seg) else f"{ratio_seg:.2f}", used,
             n_core_bp, f"{perc_core_bp:.2f}", len(core_indel), flank_bp, flank_split,
-            f"{statistics.median(bp_dist):.0f}" if bp_dist else "NA", status]
+            f"{statistics.median(bp_dist):.0f}" if bp_dist else "NA", status,
+            "NA" if not np.isfinite(ratio_base) else f"{ratio_base:.2f}",
+            bool(np.isfinite(ratio_base) and ratio_base >= a.ambiguous_ratio)]
 
 
 HEADER = ["Sample", "Chrom", "Start", "End", "Region_ID", "ROI_Length_bp",
@@ -291,7 +303,8 @@ HEADER = ["Sample", "Chrom", "Start", "End", "Region_ID", "ROI_Length_bp",
           "Core_Mean_Depth", "Flank_Mean_Depth", "Depth_Ratio_Core_vs_Flank",
           "Core_Span_Depth_AllMAPQ", "Segment_Expected_Depth", "Depth_Ratio_Core_vs_Segment", "Depth_Ratio_Used",
           "Core_Breakpoints", "Perc_Core_Reads_With_BP", "Core_Large_Indels",
-          "Flank_Breakpoints", "Flank_Split_Reads", "Median_BP_Dist_To_ROI_bp", "Structural_Status"]
+          "Flank_Breakpoints", "Flank_Split_Reads", "Median_BP_Dist_To_ROI_bp", "Structural_Status",
+          "Depth_Ratio_Core_vs_Baseline", "Coord_Ambiguous"]
 
 
 def main():
@@ -300,6 +313,9 @@ def main():
         sys.exit(f"[ERROR] BED file '{a.bed}' not found.")
     rois = read_rois(a.bed)
     seg = SegmentDepth(a.cnv_windows) if a.cnv_windows else None
+    if seg or a.baseline_depth:
+        print(f"[INFO] disomic baseline for Coord_Ambiguous: {a.baseline_depth or seg.baseline:.1f}x "
+              f"(flag at >= {a.ambiguous_ratio:g} x)")
     print(f"[INFO] {len(rois)} ROIs | core ROI +/- {a.core_buffer_bp} bp | flanks +/- {a.max_distance_bp} bp | "
           f"MAPQ >= {a.min_mapq} | depth ratio for classification: {'CN segment' if seg else 'flanks'}")
 
@@ -309,15 +325,21 @@ def main():
             sample = os.path.basename(bam)
             with pysam.AlignmentFile(bam, "rb") as sam:
                 refs = set(sam.references)
-                skipped = 0
+                skipped = n_flank = n_amb = 0
                 for k, (chrom, s, e, rid) in enumerate(rois, 1):
                     if chrom not in refs:
                         skipped += 1
                         continue
                     row = audit_roi(sam, chrom, s, e, a, seg)
+                    n_flank += bool(seg) and row[13] == "flank"
+                    n_amb += bool(row[-1])
                     out.write("\t".join(map(str, [sample] + row[:3] + [rid] + row[3:])) + "\n")
                     if k % 500 == 0:
                         print(f"[INFO] {sample}: {k}/{len(rois)} ROIs")
+                if seg and n_flank:
+                    print(f"[WARN] {sample}: {n_flank} ROIs had no CN-segment depth (midpoint in an excluded window) and "
+                          "were classified with the core/flank ratio (column Depth_Ratio_Used)")
+                print(f"[INFO] {sample}: {n_amb} ROIs flagged Coord_Ambiguous")
                 if skipped:
                     print(f"[WARN] {sample}: {skipped} ROIs on chromosomes absent from the BAM were skipped.")
     print(f"[INFO] Audit completed: {a.output}")

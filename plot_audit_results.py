@@ -122,7 +122,8 @@ def main():
                  "above the dotted line, regions are discarded\nonly when fewer than 3 reads span the core",
                  transform=axes[1].transAxes, ha="right", va="top", fontsize=8, color="#444444")
     axes[1].set_title("B. Depth vs. core breakpoints", fontsize=12, fontweight="bold", loc="left")
-    axes[1].set_xlabel(ratio_label)
+    axes[1].set_xlabel(ratio_label + " (log scale)")
+    axes[1].set_xscale("log")
     axes[1].set_ylabel("Reads with a core breakpoint (%)")
     handles, labels = axes[1].get_legend_handles_labels()
     axes[1].legend().remove()

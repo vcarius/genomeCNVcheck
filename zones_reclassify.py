@@ -54,6 +54,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+from scipy.stats import nbinom, poisson
 
 
 def main():
@@ -76,6 +77,17 @@ def main():
                          "collapses), segment = median depth of the CN segment (copy number only). Both are reported")
     ap.add_argument("--type-names", nargs=2, default=["origins", "IZ"], metavar=("SINGLE", "ZONE"),
                     help="type names for <o>_typed.bed (default origins IZ; use terminations TZ)")
+    ap.add_argument("--fixed-window", type=int, default=0,
+                    help="Statistical test: count retained molecules in the densest window of this size inside each "
+                         "merger (e.g. 2000, the paper's IZD) instead of the whole merger (default 0 = whole merger). "
+                         "Also centres <o>_zones_2kb.bed on that window instead of the merger midpoint")
+    ap.add_argument("--ambiguous-ratio", type=float, default=3.0,
+                    help="local depth / disomic depth >= this: coordinate ambiguous (collapsed copies fold onto one "
+                         "reference position); such mergers are not tested and are left out of the background (default 3.0)")
+    ap.add_argument("--tile-bp", type=int, default=10000,
+                    help="Tile size used to estimate the negative-binomial overdispersion of the background (default "
+                         "10000, about the span of a zone; uses --fixed-window when that is set)")
+    ap.add_argument("--fdr", type=float, default=0.05, help="Benjamini-Hochberg level for status_stat (default 0.05)")
     a = ap.parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(a.out_prefix)) or ".", exist_ok=True)
 
@@ -188,6 +200,81 @@ def main():
     mg["normalised_retained_segment"] = np.round(mg["n_retained"] * base / mg["segment_depth"], 2)
     norm_col = "normalised_retained" if a.depth_scope == "local" else "normalised_retained_segment"
 
+    # ---- statistical zone call: retained molecules vs. the number expected from the local depth -------------------
+    # expected = lambda x sum(depth x bp) over the counted span, lambda = retained molecules per read bp in the genome
+    # outside low-mappability and ambiguous (collapsed) windows; NB overdispersion estimated on tiles of the genome.
+    lowmap = w["low_mappability"].astype(str).str.lower().eq("true") if "low_mappability" in w.columns \
+        else pd.Series(False, index=w.index)
+    w["bg_ok"] = np.isfinite(w[col]) & ~lowmap & (w[col] / base < a.ambiguous_ratio)
+    w["mol"] = 0
+    ret = m[m["retained"]]
+    for c, g in w.groupby("chrom"):
+        mids = np.sort(ret.loc[ret["chrom"] == c, "mid"].to_numpy())
+        st, en = g["start"].to_numpy(), g["end"].to_numpy()
+        w.loc[g.index, "mol"] = np.searchsorted(mids, en, side="left") - np.searchsorted(mids, st, side="left")
+    bg = w[w["bg_ok"]]
+    lam = bg["mol"].sum() / float((bg[col] * (bg["end"] - bg["start"])).sum())
+    tile = a.fixed_window if a.fixed_window > 0 else a.tile_bp
+    t = bg.assign(tile=bg["start"] // tile, rb=bg[col] * (bg["end"] - bg["start"]), bp=bg["end"] - bg["start"])
+    t = t.groupby(["chrom", "tile"]).agg(n=("mol", "sum"), rb=("rb", "sum"), bp=("bp", "sum"))
+    t = t[t["bp"] >= tile / 2]
+    mu_t = lam * t["rb"]
+    alpha = max(0.0, float((((t["n"] - mu_t) ** 2 - t["n"]).sum()) / (mu_t ** 2).sum()))
+    print(f"[INFO] background: {lam * 1e6:.3f} retained molecules per read Mb; NB overdispersion alpha = {alpha:.3f} "
+          f"({len(t)} tiles of {tile} bp)")
+
+    def densest(mids, W):
+        mids = np.sort(mids)
+        if len(mids) == 0:
+            return 0, np.nan
+        j = np.searchsorted(mids, mids + W, side="left")
+        k = int(np.argmax(j - np.arange(len(mids))))
+        inside = mids[k:j[k]]
+        return int(j[k] - k), float((inside[0] + inside[-1]) // 2)
+
+    n_test, s_test, e_test, cen_test = [], [], [], []
+    for i, r in mg.iterrows():
+        mids = m.loc[(m["merger"] == i) & m["retained"], "mid"].to_numpy()
+        if a.fixed_window > 0:
+            n_k, cc = densest(mids, a.fixed_window)
+            cc = (r.start + r.end) // 2 if not np.isfinite(cc) else int(cc)
+            n_test.append(n_k)
+            s_test.append(cc - a.fixed_window // 2)
+            e_test.append(cc + a.fixed_window // 2)
+            cen_test.append(cc)
+        else:
+            n_test.append(len(mids))
+            s_test.append(r.start)
+            e_test.append(r.end)
+            cen_test.append((r.start + r.end) // 2)
+    mg["n_tested"] = n_test
+    mg["test_center"] = cen_test
+    dep_t = np.array([depth_over(c, s, e) for c, s, e in zip(mg["chrom"], s_test, e_test)])
+    mg["expected"] = np.round(lam * dep_t * (np.array(e_test) - np.array(s_test)), 2)
+    mg["obs_over_expected"] = np.round(mg["n_tested"] / mg["expected"], 2)
+    amb = (mg["local_depth"] / base >= a.ambiguous_ratio).to_numpy()
+    mu = mg["expected"].to_numpy(dtype=float)
+    k = mg["n_tested"].to_numpy()
+    if alpha > 0:
+        pv = nbinom.sf(k - 1, 1 / alpha, 1 / (1 + alpha * mu))
+    else:
+        pv = poisson.sf(k - 1, mu)
+    pv = np.where(np.isfinite(mu) & ~amb, pv, np.nan)
+    q = np.full(len(pv), np.nan)
+    ok = np.isfinite(pv)
+    if ok.any():                                   # Benjamini-Hochberg over every tested merger
+        o = np.argsort(pv[ok])
+        ranked = pv[ok][o] * ok.sum() / np.arange(1, ok.sum() + 1)
+        qq = np.minimum.accumulate(ranked[::-1])[::-1].clip(max=1)
+        tmp = np.empty(ok.sum())
+        tmp[o] = qq
+        q[ok] = tmp
+    mg["p_NB"] = [float(f"{x:.3g}") if np.isfinite(x) else np.nan for x in pv]
+    mg["q_BH"] = [float(f"{x:.3g}") if np.isfinite(x) else np.nan for x in q]
+    mg["status_stat"] = np.where(amb, "ambiguous_coordinate", np.where(q < a.fdr, "enriched", ""))
+    print(f"[INFO] statistical call (q < {a.fdr:g}): " + ", ".join(
+        f"{k_}={v}" for k_, v in mg.loc[mg["status_stat"] != "", "status_stat"].value_counts().items()))
+
     T = a.zone_min
     NT = a.norm_gt if a.norm_gt is not None else T - 1
     print(f"[INFO] zone rule: molecules >= {T} (integer counts); normalised > {NT:g}")
@@ -213,16 +300,17 @@ def main():
     mg["paper_zone"] = paper
     cols = ["chrom", "start", "end", "span_bp", "paper_zone", "status", "CN_State", "n_CN_states", "n_all",
             "n_retained", "not_retained", "local_depth", "segment_depth", "local_vs_segment", "normalised_all",
-            "normalised_retained", "normalised_retained_segment", "status_local", "status_segment"]
-    out = mg[(mg["status_local"] != "") | (mg["status_segment"] != "")][cols].sort_values(["paper_zone", "status", "chrom", "start"],
+            "normalised_retained", "normalised_retained_segment", "status_local", "status_segment",
+            "n_tested", "expected", "obs_over_expected", "p_NB", "q_BH", "status_stat"]
+    out = mg[(mg["status_local"] != "") | (mg["status_segment"] != "") | (mg["status_stat"] != "")][cols].sort_values(["paper_zone", "status", "chrom", "start"],
                                                     ascending=[False, True, True, True])
     out.to_csv(f"{a.out_prefix}_zones.tsv", sep="\t", index=False)
     print(out.drop(columns=["not_retained", "status_local", "n_CN_states", "span_bp", "paper_zone"]).to_string(index=False))
 
     z = mg[paper]
-    cen = (z["start"] + z["end"]) // 2
+    cen = z["test_center"].astype(int) if a.fixed_window > 0 else (z["start"] + z["end"]) // 2
     pd.DataFrame({"chrom": z["chrom"], "s": cen - 1000, "e": cen + 1000,
-                  "name": z["status"] + "|" + z["CN_State"]}).to_csv(
+                  "name": z["status"] + "|" + z["CN_State"] + "|" + z["status_stat"].replace("", "not_enriched")}).to_csv(
         f"{a.out_prefix}_zones_2kb.bed", sep="\t", header=False, index=False)
     single, zone = a.type_names
     m["type"] = np.where(m["merger"].map(mg["n_all"]) >= T, zone, single)

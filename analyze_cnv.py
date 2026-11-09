@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-analyze_cnv.py — copy-number (CN) estimation from long-read depth.
+analyze_cnv_v3.py — copy-number (CN) estimation from long-read depth.
 
 Designed for T. cruzi CL Brener reads mapped to the haploid Esmeraldo-like reference: both
 haplotypes stack on the same sequence, so the dominant depth peak is the DISOMIC state
@@ -21,7 +21,7 @@ Steps
   6. Per-chromosome summary with block-bootstrap CI of the median (windows are autocorrelated).
 
 Usage
-  python3 analyze_cnv.py <data_dir> <plot_dir> [options]
+  python3 analyze_cnv_v3.py <data_dir> <plot_dir> [options]
 
 Inputs in <data_dir>
   coverage.regions.bed.gz   mosdepth --by output
@@ -76,6 +76,9 @@ def parse_args():
     p.add_argument("--mappability-log2", type=float, default=0.5,
                    help="|log2(depth ratio main/strict)| above this = low mappability (default 0.5)")
     p.add_argument("--suffix", default="", help="Suffix for all output files (e.g. _focal)")
+    p.add_argument("--gc-ref-windows", default=None,
+                   help="window_cnv_calls.tsv of a previous run: fit the GC curve only on windows that were disomic "
+                        "there (second pass), so real gains/losses that correlate with GC are not corrected away")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -124,12 +127,16 @@ def kde_peak(values, bw):
     return float(xs[peaks[np.argmax(props["prominences"])]]), xs, ys
 
 
-def gc_correct(df, min_bin):
+def gc_correct(df, min_bin, ref_mask=None):
     """Divide depth by the median depth of its GC bin (only windows with depth > 0 define the
-    medians). A bin with fewer than min_bin windows is widened symmetrically until it has enough."""
+    medians). A bin with fewer than min_bin windows is widened symmetrically until it has enough.
+    ref_mask: only these windows define the GC curve (e.g. windows disomic in a first pass)."""
     d = df.copy()
     d["gc_bin"] = (d["gc_acgt"] * 100).round().clip(0, 100).astype(int)
-    ref = d.loc[d["depth_eff"] > 0, ["gc_bin", "depth_eff"]]
+    use = d["depth_eff"] > 0
+    if ref_mask is not None:
+        use &= ref_mask
+    ref = d.loc[use, ["gc_bin", "depth_eff"]]
     by_bin = {b: g["depth_eff"].values for b, g in ref.groupby("gc_bin")}
     medians = {}
     for b in range(101):
@@ -263,7 +270,14 @@ def main():
     df["depth_eff"] = df["depth"] / (1.0 - df["frac_N"])
 
     print("[PY] GC correction...")
-    df = gc_correct(df, a.min_gc_bin)
+    ref_mask = None
+    if a.gc_ref_windows:
+        prev = pd.read_csv(a.gc_ref_windows, sep="\t", dtype={"chrom": str}, usecols=["chrom", "start", "end", "seg_state"])
+        prev = prev[prev["seg_state"] == "disomic"].assign(_ref=True)
+        ref_mask = df.merge(prev[["chrom", "start", "end", "_ref"]], on=["chrom", "start", "end"],
+                            how="left")["_ref"].fillna(False).astype(bool).to_numpy()
+        print(f"[PY] GC curve fitted on {int(ref_mask.sum())} windows disomic in {a.gc_ref_windows}")
+    df = gc_correct(df, a.min_gc_bin, ref_mask)
 
     print("[PY] Disomic baseline from the dominant KDE peak...")
     base, xs, ys = kde_peak(df["depth_gc"].values, a.bw)
@@ -318,6 +332,7 @@ def main():
             ok = ~df.loc[rows, "low_mappability"].values
             vals = df.loc[rows, "copy_number"].values[ok]
             seg_cn = float(np.median(vals)) if vals.size else np.nan
+            seg_mean = float(np.mean(vals)) if vals.size else np.nan
             df.loc[rows, "seg_id"] = seg_counter
             seg_rows.append(OrderedDict([
                 ("chrom", chrom),
@@ -329,6 +344,11 @@ def main():
                 ("median_cn", round(seg_cn, 3) if np.isfinite(seg_cn) else np.nan),
                 ("copies_est", round(2 * seg_cn, 2) if np.isfinite(seg_cn) else np.nan),
                 ("state", nearest_state(seg_cn)),
+                # distance to the nominal value of the state (mosaicism / intermediate CN) and tail of the segment
+                # (mean / median > 1: focal high-depth windows that inflate any depth sum, e.g. the rate denominator)
+                ("dev_from_state", round(seg_cn - STATES[nearest_state(seg_cn)], 3)
+                 if np.isfinite(seg_cn) and nearest_state(seg_cn) != "amplified" else np.nan),
+                ("mean_over_median", round(seg_mean / seg_cn, 3) if np.isfinite(seg_cn) and seg_cn > 0 else np.nan),
                 ("frac_low_mappability", round(float(1 - ok.mean()), 3)),
             ]))
             seg_counter += 1

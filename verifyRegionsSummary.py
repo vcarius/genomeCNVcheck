@@ -50,8 +50,8 @@ STATE_ORDER = ["loss_0copies", "loss_1copy", "disomic", "gain_3copies", "gain_4c
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-a", "--audit", required=True, help="verifyRegions.py TSV, or a plain BED of events")
-    p.add_argument("-s", "--segments", required=True, help="cnv_segments.bed (analyze_cnv.py)")
-    p.add_argument("-w", "--windows", required=True, help="window_cnv_calls.tsv (analyze_cnv.py)")
+    p.add_argument("-s", "--segments", required=True, help="cnv_segments.bed (analyze_cnv_v3.py)")
+    p.add_argument("-w", "--windows", required=True, help="window_cnv_calls.tsv (analyze_cnv_v3.py)")
     p.add_argument("-g", "--gc", default=None,
                    help="windows_gc.tsv (frac_N) to locate N gaps; without it, positions outside the "
                         "analysed windows are treated as gaps")
@@ -62,6 +62,15 @@ def parse_args():
                         "(ignores clustering; optimistic p-values)")
     p.add_argument("--min-shift", type=int, default=25000, help="Minimum circular shift, analysable bp (default 25000)")
     p.add_argument("--depth-col", default="depth_eff", help="Depth column for the rate denominator (default depth_eff)")
+    p.add_argument("--depth-bed", default=None,
+                   help="mosdepth regions file of the same windows (e.g. coverage_mapq20.regions.bed.gz) used as the "
+                        "rate denominator instead of --depth-col (closer to the reads DNAscent keeps)")
+    p.add_argument("--mask-ratio", type=float, default=None,
+                   help="Mask windows with depth / median depth of their CN segment above this (e.g. 1.6, the audit's "
+                        "collapse ratio) and low-mappability windows, in BOTH the numerator (events whose midpoint is "
+                        "there) and the denominator of the rate and of the CN slope. Default: no mask (old behaviour)")
+    p.add_argument("--slope-max-cn", type=float, default=3.0,
+                   help="CN slope: leave out segments with relative CN above this (default 3.0 = 'amplified')")
     p.add_argument("--n-boot", type=int, default=2000, help="Bootstrap replicates for rate CIs (default 2000)")
     p.add_argument("--near-gap-bp", type=int, default=10000)
     p.add_argument("--seed", type=int, default=42)
@@ -290,15 +299,102 @@ def oe_test(events, windows, n_perm, seed, min_shift_bp, mode, chunk=250):
 
 
 # ----------------------------------------------------------------------------- rate per read Mb
+def mask_windows(windows, depth_col, ratio):
+    """True = window left out of rate and slope: low mappability, or depth / median depth of its CN segment > ratio
+    (focal collapses inside a segment: their events are discarded by the audit, so their depth must go too)."""
+    if ratio is None:
+        return np.zeros(len(windows), dtype=bool)
+    lowmap = windows["low_mappability"].astype(str).str.lower().eq("true").to_numpy() \
+        if "low_mappability" in windows.columns else np.zeros(len(windows), dtype=bool)
+    ok = (windows["seg_id"] >= 0) & ~lowmap
+    med = windows[ok].groupby("seg_id")[depth_col].median()
+    rel = windows[depth_col] / windows["seg_id"].map(med)
+    return lowmap | (rel > ratio).fillna(False).to_numpy()
+
+
+def midpoint_masked(events, windows):
+    """True for events whose midpoint lies in a masked window."""
+    out = np.zeros(len(events), dtype=bool)
+    pos = {c: g.sort_values("start") for c, g in windows.groupby("chrom")}
+    for c, idx in events.groupby("Chrom").groups.items():
+        g = pos.get(c)
+        if g is None:
+            continue
+        idx = np.asarray(idx)
+        mids = ((events.loc[idx, "Start"] + events.loc[idx, "End"]) // 2).to_numpy()
+        st, en, mk = g["start"].to_numpy(), g["end"].to_numpy(), g["masked"].to_numpy()
+        i = np.searchsorted(st, mids, side="right") - 1
+        ii = np.clip(i, 0, len(st) - 1)
+        hit = (i >= 0) & (mids < en[ii])
+        out[events.index.get_indexer(idx)] = hit & mk[ii]
+    return out
+
+
+def _poisson_fit(X, y, offset, iters=50):
+    """Poisson GLM (log link, offset) by IRLS. Coefficients of all-zero columns are NaN."""
+    used = np.any(X != 0, axis=0)
+    used[0] = True
+    Xu = X[:, used]
+    beta = np.zeros(Xu.shape[1])
+    beta[0] = np.log(max(y.sum(), 0.5) / np.exp(offset).sum())
+    for _ in range(iters):
+        eta = Xu @ beta + offset
+        mu = np.exp(eta)
+        z = eta - offset + (y - mu) / mu
+        sw = np.sqrt(mu)
+        new = np.linalg.lstsq(Xu * sw[:, None], z * sw, rcond=None)[0]
+        if np.max(np.abs(new - beta)) < 1e-8:
+            beta = new
+            break
+        beta = new
+    full = np.full(X.shape[1], np.nan)
+    full[used] = beta
+    return full
+
+
+def cn_slope(events, windows, max_cn, n_boot, seed):
+    """Events per segment ~ offset(log analysed bp) + gamma_loss * min(log CN, 0) + gamma_gain * max(log CN, 0),
+    i.e. events per bp proportional to CN**gamma (separately below and above the disomic level).
+    gamma = 1: events scale with copy number (each copy fires like a disomic one); gamma = 0: events are tied to the
+    position and do not scale with copies. Offset in bp, not read bp, so the depth denominator plays no role.
+    CI: bootstrap of segments (segments are the independent unit)."""
+    rng = np.random.default_rng(seed)
+    w = windows[(windows["seg_id"] >= 0) & ~windows["masked"] & windows["seg_cn"].notna()]
+    seg = w.assign(bp=w["end"] - w["start"]).groupby("seg_id").agg(cn=("seg_cn", "first"), bp=("bp", "sum"),
+                                                                     state=("seg_state", "first"))
+    ev = events[(events["Midpoint_Seg_ID"] >= 0) & ~events["Midpoint_Masked"]]
+    seg["n"] = ev.groupby("Midpoint_Seg_ID").size().reindex(seg.index).fillna(0)
+    seg = seg[(seg["cn"] > 0.1) & (seg["cn"] <= max_cn) & (seg["bp"] > 0)]
+    x = np.log(seg["cn"].to_numpy())             # natural log: events proportional to CN**gamma
+    X = np.column_stack([np.ones(len(seg)), np.minimum(x, 0), np.maximum(x, 0)])
+    y, off = seg["n"].to_numpy(float), np.log(seg["bp"].to_numpy(float))
+    est = _poisson_fit(X, y, off)
+    boots = np.array([_poisson_fit(X[k], y[k], off[k])
+                      for k in (rng.integers(0, len(seg), len(seg)) for _ in range(n_boot))])
+    mu = np.exp(X @ np.nan_to_num(est) + off)
+    disp = float(np.sum((y - mu) ** 2 / mu) / max(len(y) - 3, 1))
+    rows = []
+    for j, (term, side) in enumerate([("intercept_log_events_per_bp", None),
+                                      ("gamma_loss", "loss"), ("gamma_gain", "gain")]):
+        b = boots[:, j][np.isfinite(boots[:, j])]
+        nd = (seg["state"] != "disomic").to_numpy()     # segments that actually inform this slope
+        n_seg = int(len(seg)) if side is None else int((((x < 0) if side == "loss" else (x > 0)) & nd).sum())
+        rows.append({"term": term, "estimate": round(float(est[j]), 3),
+                     "CI95_segment_bootstrap": f"{np.quantile(b, 0.025):.3f} to {np.quantile(b, 0.975):.3f}" if len(b) else "NA",
+                     "n_non_disomic_segments_this_side": n_seg, "n_segments_total": int(len(seg)),
+                     "pearson_dispersion": round(disp, 2)})
+    return pd.DataFrame(rows)
+
+
 def rate_by_state(events, windows, depth_col, n_boot, seed):
     """Events per Mb of read sequence in each CN state; CI by resampling CN segments within each state."""
     rng = np.random.default_rng(seed)
-    w = windows[windows["seg_state"].isin(STATE_ORDER) & (windows["seg_id"] >= 0)].copy()
+    w = windows[windows["seg_state"].isin(STATE_ORDER) & (windows["seg_id"] >= 0) & ~windows["masked"]].copy()
     if depth_col not in w.columns:
         sys.exit(f"[ERROR] column '{depth_col}' not found in window_cnv_calls.tsv")
     w["read_bp"] = w[depth_col].clip(lower=0) * (w["end"] - w["start"])
     seg = w.groupby("seg_id").agg(state=("seg_state", "first"), read_bp=("read_bp", "sum"))
-    ev = events[events["Midpoint_Seg_ID"] >= 0]
+    ev = events[(events["Midpoint_Seg_ID"] >= 0) & ~events["Midpoint_Masked"]]
     seg["n_events"] = ev.groupby("Midpoint_Seg_ID").size().reindex(seg.index).fillna(0)
     states = [s for s in STATE_ORDER if s in set(seg["state"])]
 
@@ -336,10 +432,23 @@ def main():
     segs = read_segments(a.segments)
     windows = pd.read_csv(a.windows, sep="\t", dtype={"chrom": str}, na_values=["NA"])
     if "seg_state" not in windows.columns:
-        sys.exit("[ERROR] window_cnv_calls.tsv has no 'seg_state': use analyze_cnv.py output.")
+        sys.exit("[ERROR] window_cnv_calls.tsv has no 'seg_state': use analyze_cnv_v3.py output.")
     windows["seg_id"] = windows["seg_id"].fillna(-1).astype(int)
+    depth_col = a.depth_col
+    if a.depth_bed:
+        d = pd.read_csv(a.depth_bed, sep="\t", header=None, comment="#", usecols=[0, 1, 2, 3],
+                        names=["chrom", "start", "end", "depth_ext"], dtype={"chrom": str})
+        windows = windows.merge(d, on=["chrom", "start", "end"], how="left")
+        if windows["depth_ext"].isna().mean() > 0.01:
+            sys.exit(f"[ERROR] windows not found in {a.depth_bed}: use the depth file of the same run_cnv.sh run")
+        depth_col = "depth_ext"
+    windows["masked"] = mask_windows(windows, depth_col, a.mask_ratio)
+    if a.mask_ratio is not None:
+        print(f"[INFO] mask: {int(windows['masked'].sum())} windows ({windows['masked'].mean():.1%}) left out of the "
+              f"rate and slope (low mappability or depth > {a.mask_ratio:g} x segment median, '{depth_col}')")
 
     ev = annotate(ev, segs, windows, gap_intervals(windows, a.gc))
+    ev["Midpoint_Masked"] = midpoint_masked(ev, windows)
     ev["Near_Gap"] = ev["Dist_To_Gap_bp"] <= a.near_gap_bp
     ev["Final_Classification"] = ev.apply(classify, axis=1)
     ev.to_csv(f"{a.out_prefix}_annotated.tsv", sep="\t", index=False)
@@ -352,8 +461,10 @@ def main():
                    ignore_index=True)
     oe = oe[["Set"] + [c for c in oe.columns if c != "Set"]]
     oe.to_csv(f"{a.out_prefix}_OE_by_CN_state.tsv", sep="\t", index=False)
-    rate = rate_by_state(kept, windows, a.depth_col, a.n_boot, a.seed)
+    rate = rate_by_state(kept, windows, depth_col, a.n_boot, a.seed)
     rate.to_csv(f"{a.out_prefix}_rate_by_CN_state.tsv", sep="\t", index=False)
+    slope = cn_slope(kept, windows, a.slope_max_cn, a.n_boot, a.seed)
+    slope.to_csv(f"{a.out_prefix}_CN_slope.tsv", sep="\t", index=False)
 
     n = len(ev)
     L = ["=" * 78, f" SUMMARY — {a.audit}", "=" * 78, f"Events: {n}"]
@@ -371,15 +482,21 @@ def main():
           "  -> interpret for LOCI (one record per site)",
           oe.to_string(index=False),
           "-" * 78,
-          f"Events per Mb of read sequence per CN state (set '{kept_label}', depth '{a.depth_col}', "
-          f"{a.n_boot} segment bootstraps)",
+          f"Events per Mb of read sequence per CN state (set '{kept_label}', depth '{depth_col}', "
+          f"{a.n_boot} segment bootstraps"
+          + (f", mask {a.mask_ratio:g} x segment median + low mappability" if a.mask_ratio is not None else ", no mask")
+          + ")",
           "  -> interpret for PER-READ calls: a constant rate means CN does not change firing per molecule",
-          rate.to_string(index=False), "=" * 78]
+          rate.to_string(index=False),
+          "-" * 78,
+          f"CN slope (Poisson, offset = analysed bp, segments with CN <= {a.slope_max_cn:g}, {a.n_boot} segment bootstraps)",
+          "  gamma = 1: events scale with copies; gamma = 0: events tied to the position (do not scale with copies)",
+          slope.to_string(index=False), "=" * 78]
     txt = "\n".join(L)
     print(txt)
     with open(f"{a.out_prefix}_summary.txt", "w") as fh:
         fh.write(txt + "\n")
-    for suf in ["_annotated.tsv", "_OE_by_CN_state.tsv", "_rate_by_CN_state.tsv", "_summary.txt"]:
+    for suf in ["_annotated.tsv", "_OE_by_CN_state.tsv", "_rate_by_CN_state.tsv", "_CN_slope.tsv", "_summary.txt"]:
         print(f"[OK] {a.out_prefix}{suf}")
 
 
