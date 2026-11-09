@@ -12,7 +12,7 @@
 ################################################################################
 set -euo pipefail
 
-THREADS=32
+THREADS=4
 WINDOW_SIZE=1000
 MIN_MAPQ=0           # keep multi-mapping reads (MAPQ 0): needed for repeat-rich T. cruzi regions
 MASK_MAPQ=20         # second pass to flag low-mappability windows; 0 disables it
