@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ################################################################################
-# mapping_V2.sh — repeat-aware long-read mapping with Winnowmap2
+# mapping.sh — repeat-aware long-read mapping with Winnowmap2
 #
 # High-frequency k-mers (Meryl, k=15, above the 0.9998 'distinct' fraction) are passed to
 # Winnowmap with -W. They are DOWN-WEIGHTED during minimizer selection; no sequence is masked
